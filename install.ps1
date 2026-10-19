@@ -1,17 +1,26 @@
 ﻿# install.ps1 — One-command setup for claude-code-notification
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\hook-common.ps1"
 $HooksDir     = "$env:USERPROFILE\.claude\hooks"
 $SettingsPath = "$env:USERPROFILE\.claude\settings.json"
 $ScriptDir    = $PSScriptRoot
-$HookCmd      = '& "$env:USERPROFILE\.claude\hooks\cc-notif.ps1"'
+# Bypass applies to this one process, so the hook runs even when the user's execution policy blocks scripts.
+$HookCmd      = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\hooks\cc-notif.ps1"'
 
 # 1. Ensure hooks dir
 New-Item -ItemType Directory -Force $HooksDir | Out-Null
 
 # 2. Install hook script
 Copy-Item "$ScriptDir\notify.ps1" "$HooksDir\cc-notif.ps1" -Force
+Copy-Item "$ScriptDir\hook-common.ps1" "$HooksDir\cc-notif-common.ps1" -Force
 Write-Host "[OK] Hook installed: $HooksDir\cc-notif.ps1" -ForegroundColor Green
+
+# Windows 11 silently drops toasts from an unregistered app ID; register ours for this user.
+$AppIdKey = 'HKCU:\Software\Classes\AppUserModelId\ClaudeCode.Notify'
+New-Item $AppIdKey -Force | Out-Null
+New-ItemProperty $AppIdKey -Name DisplayName -Value 'Claude Code' -Force | Out-Null
+Write-Host "[OK] Toast app ID registered: ClaudeCode.Notify" -ForegroundColor Green
 
 # 3. Config: migrate old .ps1 config or create new .json
 $OldConfig = "$HooksDir\cc-notif-config.ps1"
@@ -53,7 +62,9 @@ if ((Test-Path $OldConfig) -and !(Test-Path $NewConfig)) {
 
 # 4. Patch settings.json — APPEND to existing hooks, don't overwrite
 if (Test-Path $SettingsPath) {
-    $s = Get-Content $SettingsPath -Raw | ConvertFrom-Json
+    try { $s = Get-Content $SettingsPath -Raw | ConvertFrom-Json }
+    catch { throw "settings.json is not valid JSON. Nothing was changed: $SettingsPath" }
+    if ($null -eq $s) { throw "settings.json is empty. Nothing was changed: $SettingsPath" }
 } else {
     $s = [PSCustomObject]@{}
 }
@@ -62,8 +73,20 @@ if (!$s.PSObject.Properties['hooks']) {
     $s | Add-Member -NotePropertyName hooks -NotePropertyValue ([PSCustomObject]@{})
 }
 
-foreach ($evt in 'Stop', 'Notification') {
-    $cmd = "$HookCmd -HookEvent $evt"
+# Older installs toasted every finished subagent; drop that registration.
+if ($s.hooks.PSObject.Properties['SubagentStop']) {
+    $groups = @($s.hooks.SubagentStop | ForEach-Object {
+        $_.hooks = @($_.hooks | Where-Object { !(Test-ProjectHookCommand $_.command) })
+        if ($_.hooks.Count) { $_ }
+    })
+    if ($groups.Count) { $s.hooks.SubagentStop = $groups } else { $s.hooks.PSObject.Properties.Remove('SubagentStop') }
+    Write-Host "[OK] Removed old per-subagent SubagentStop hook." -ForegroundColor Green
+}
+
+# PreToolUse on the Agent tool fires when the main agent launches a subagent.
+foreach ($evt in 'Stop', 'Notification', 'PreToolUse') {
+    $flag = if ($evt -eq 'PreToolUse') { 'AgentStart' } else { $evt }
+    $cmd = "$HookCmd -HookEvent $flag"
     $newHookGroup = [PSCustomObject]@{
         hooks = @([PSCustomObject]@{
             type    = "command"
@@ -72,16 +95,22 @@ foreach ($evt in 'Stop', 'Notification') {
             async   = $true
         })
     }
+    if ($evt -eq 'PreToolUse') { $newHookGroup | Add-Member -NotePropertyName matcher -NotePropertyValue 'Agent|Task' }
 
     if ($s.hooks.PSObject.Properties[$evt]) {
         $existing = @($s.hooks.$evt)
-        # Match on the bare script path so a v1 Stop hook (no -HookEvent) is seen as installed too.
+        # An older install may use a command the execution policy blocks; rewrite it in place.
         $alreadyInstalled = $false
         foreach ($group in $existing) {
             foreach ($h in @($group.hooks)) {
-                if ($h.command -like "$HookCmd*") { $alreadyInstalled = $true; break }
+                if (Test-ProjectHookCommand $h.command) {
+                    $alreadyInstalled = $true
+                    if ($h.command -ne $cmd) {
+                        $h.command = $cmd
+                        Write-Host "[OK] $evt hook updated to bypass execution policy." -ForegroundColor Green
+                    }
+                }
             }
-            if ($alreadyInstalled) { break }
         }
         if (!$alreadyInstalled) {
             $s.hooks.$evt = @($existing) + @($newHookGroup)

@@ -1,54 +1,83 @@
-﻿# uninstall.ps1 — Remove claude-code-notification
+﻿# uninstall.ps1 — Remove Claude Code hooks from the current Windows user
+param([ValidateSet('1', '2')][string]$Mode)
 
 $ErrorActionPreference = 'Stop'
-$HooksDir     = "$env:USERPROFILE\.claude\hooks"
-$SettingsPath = "$env:USERPROFILE\.claude\settings.json"
-$HookCmd      = '& "$env:USERPROFILE\.claude\hooks\cc-notif.ps1"'
+. "$PSScriptRoot\hook-common.ps1"
+$ClaudeDir    = "$env:USERPROFILE\.claude"
+$HooksDir     = "$ClaudeDir\hooks"
+$SettingsPath = "$ClaudeDir\settings.json"
+$ProjectFiles = @("cc-notif.ps1", "cc-notif-common.ps1", "cc-notif-config.json", "cc-notif-config.ps1.bak")
 
-# 1. Remove hooks from settings.json
-if (Test-Path $SettingsPath) {
-    $s = Get-Content $SettingsPath -Raw | ConvertFrom-Json
-    $removed = $false
-    foreach ($evt in 'Stop', 'Notification') {
-        if ($s.hooks -and $s.hooks.PSObject.Properties[$evt]) {
-            # -like matches both v1 (bare path) and v2 (path + -HookEvent) commands.
-            $filtered = @($s.hooks.$evt) | Where-Object {
-                $keep = $true
-                foreach ($h in @($_.hooks)) {
-                    if ($h.command -like "$HookCmd*") { $keep = $false; break }
-                }
-                $keep
-            }
-            if ($filtered.Count -eq 0) {
-                $s.hooks.PSObject.Properties.Remove($evt)
-            } else {
-                $s.hooks.$evt = @($filtered)
-            }
-            $removed = $true
-            Write-Host "[OK] $evt hook removed from settings.json" -ForegroundColor Green
-        } else {
-            Write-Host "[--] No $evt hook found in settings.json" -ForegroundColor Cyan
-        }
-    }
-    if ($removed) {
-        $s | ConvertTo-Json -Depth 10 | Set-Content $SettingsPath -Encoding utf8
-    }
-} else {
-    Write-Host "[--] settings.json not found" -ForegroundColor Cyan
+function Save-Settings($s) {
+    $backup = "$SettingsPath.bak-$([guid]::NewGuid().ToString('N'))"
+    Copy-Item $SettingsPath $backup
+    $s | ConvertTo-Json -Depth 20 | Set-Content $SettingsPath -Encoding utf8
+    Write-Host "[OK] settings.json saved. Backup: $backup" -ForegroundColor Green
 }
 
-# 2. Remove installed files
-$files = @(
-    "$HooksDir\cc-notif.ps1",
-    "$HooksDir\cc-notif-config.json",
-    "$HooksDir\cc-notif-config.ps1.bak"
-)
-foreach ($f in $files) {
+if (!$Mode) {
+    Write-Host "Claude Code hook uninstaller"
+    Write-Host "  1. Reset all custom hooks in $SettingsPath"
+    Write-Host "  2. Uninstall only jarvis-claude-hook"
+    $Mode = Read-Host "Choose 1 or 2"
+}
+if ($Mode -notin '1', '2') { throw "Invalid choice: $Mode" }
+
+$s = $null
+if (Test-Path $SettingsPath) {
+    try { $s = Get-Content $SettingsPath -Raw | ConvertFrom-Json }
+    catch { throw "settings.json is not valid JSON. Nothing was changed: $SettingsPath" }
+    if ($null -eq $s) { throw "settings.json is empty. Nothing was changed: $SettingsPath" }
+}
+
+if ($Mode -eq '1') {
+    if (!$s -or !$s.PSObject.Properties['hooks']) { Write-Host "[--] No custom hooks found" -ForegroundColor Cyan; exit 0 }
+    Write-Host "Hooks to remove:" -ForegroundColor Yellow
+    foreach ($evt in $s.hooks.PSObject.Properties) {
+        foreach ($group in @($evt.Value)) {
+            foreach ($h in @($group.hooks)) { Write-Host "  [$($evt.Name)] $($h.type): $($h.command)$($h.prompt)$($h.url)" }
+        }
+    }
+    if ((Read-Host "Type RESET to remove every hook above") -cne 'RESET') { Write-Host "Cancelled."; exit 0 }
+
+    $s.PSObject.Properties.Remove('hooks')
+    Save-Settings $s
+    Write-Host "Done. Script files, plugin hooks, and managed hooks are preserved." -ForegroundColor White
+    exit 0
+}
+
+$removed = $false
+if ($s -and $s.PSObject.Properties['hooks']) {
+    foreach ($evt in @($s.hooks.PSObject.Properties.Name)) {
+        $groups = @($s.hooks.$evt) | ForEach-Object {
+            $group = $_
+            $hooks = @($group.hooks | Where-Object { !(Test-ProjectHookCommand $_.command) })
+            if ($hooks.Count -ne @($group.hooks).Count) { $removed = $true }
+            if ($hooks.Count) { $group.hooks = $hooks; $group }
+        }
+        if (@($groups).Count) { $s.hooks.$evt = @($groups) } else { $s.hooks.PSObject.Properties.Remove($evt) }
+    }
+    if (!@($s.hooks.PSObject.Properties).Count) { $s.PSObject.Properties.Remove('hooks') }
+}
+if ($removed) { Save-Settings $s } else { Write-Host "[--] jarvis-claude-hook is not registered" -ForegroundColor Cyan }
+
+$cfg = "$HooksDir\cc-notif-config.json"
+if (Test-Path $cfg) {
+    $cfgBackup = "$cfg.bak-$([guid]::NewGuid().ToString('N'))"
+    Copy-Item $cfg $cfgBackup
+    Write-Host "[OK] Config backup: $cfgBackup" -ForegroundColor Green
+}
+
+foreach ($name in $ProjectFiles) {
+    $f = "$HooksDir\$name"
     if (Test-Path $f) {
         Remove-Item $f -Force
         Write-Host "[OK] Deleted: $f" -ForegroundColor Green
     }
 }
-
-Write-Host ""
-Write-Host "Uninstalled. Your other Stop hooks (if any) are preserved." -ForegroundColor White
+$AppIdKey = 'HKCU:\Software\Classes\AppUserModelId\ClaudeCode.Notify'
+if (Test-Path $AppIdKey) {
+    Remove-Item $AppIdKey -Force
+    Write-Host "[OK] Toast app ID removed: ClaudeCode.Notify" -ForegroundColor Green
+}
+Write-Host "Done. Other hooks are preserved." -ForegroundColor White

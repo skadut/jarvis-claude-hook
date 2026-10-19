@@ -1,115 +1,72 @@
-# Claude Code — Windows Notification Hook Spec
+﻿# Claude Code: Windows Notification Hook Spec
 
-Toast + text-to-speech recap of completed tasks, driven by Claude Code's hook system.
-
-## Purpose
-
-Extend the existing Windows toast notification hook (permission/idle prompts) with a
-second hook that fires when Claude finishes a turn, surfaces a recap of what was done,
-and optionally reads it aloud.
+Toast recap of each finished turn, with optional text-to-speech, driven by Claude
+Code's hook system.
 
 ## Hook events used
 
-| Event          | Fires when                                | Role in this spec                                   |
-| -------------- | ------------------------------------------ | ----------------------------------------------------- |
-| `Notification` | Claude needs input/permission (system event) | Existing toast — generic "needs attention" message |
-| `Stop`         | Claude finishes responding for a turn        | New — toast + TTS recap of the completed task        |
+| Event | Fires when | Behavior |
+|---|---|---|
+| `Notification` | Claude needs input or permission | Toast with Claude's own request text |
+| `Stop` | Claude finishes responding for a turn | Toast recap of the reply, optional speech |
+| `PreToolUse` (`Agent|Task`) | Main agent launches a subagent | Toast with the task description |
 
-`Stop` input includes `last_assistant_message`: Claude's final response text for that
-turn, provided directly in the hook's JSON payload — no transcript parsing needed.
+`Stop` input includes `last_assistant_message`: Claude's final response text for
+that turn, provided in the hook's JSON payload. No transcript parsing is needed for
+the recap.
 
-## Configuration — `settings.json`
+## Registration
+
+`install.ps1` registers one script, `cc-notif.ps1`, for all three events in
+`%USERPROFILE%\.claude\settings.json`:
 
 ```json
 {
-  "hooks": {
-    "Notification": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell.exe -ExecutionPolicy Bypass -File \"C:\\path\\to\\toast-notification.ps1\""
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell.exe -ExecutionPolicy Bypass -File \"C:\\path\\to\\stop-notify.ps1\"",
-            "async": true
-          }
-        ]
-      }
-    ]
-  }
+  "type": "command",
+  "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\.claude\\hooks\\cc-notif.ps1\" -HookEvent Stop",
+  "shell": "powershell",
+  "async": true
 }
 ```
 
-`async: true` on the `Stop` handler is required — TTS playback blocks the script, and
-without `async` Claude Code waits for the hook to exit before it's ready for the next
-prompt.
+`-ExecutionPolicy Bypass` keeps the hook working when Windows blocks unsigned
+scripts. It applies to the hook process only.
 
-## Script — `stop-notify.ps1`
+`async: true` is required. Speech blocks the script, and without `async` Claude Code
+waits for the hook to exit before it accepts the next prompt.
 
-```powershell
-$callInput = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$summary = $callInput.last_assistant_message
+## Stop recap
 
-if ([string]::IsNullOrWhiteSpace($summary)) {
-    $summary = "Task selesai"
-} elseif ($summary.Length -gt 200) {
-    $summary = $summary.Substring(0, 200) + "..."
-}
+- The toast body is `<session name>: <recap>`.
+- The recap is `last_assistant_message` with Markdown symbols (`# * \` _`) removed,
+  line breaks collapsed, and a 200-character limit.
+- When the reply is empty, the toast falls back to `message`
+  (default `Session '{0}' done!`).
+- `stopRecap: false` turns the recap off and always uses `message`.
 
-# strip markdown noise so it reads clean in a toast / TTS
-$summary = $summary -replace '[#*`_]', ''
+## Text-to-speech (opt-in)
 
-# Toast
-powershell.exe -ExecutionPolicy Bypass -File "C:\path\to\toast-notification.ps1" `
-  -Title "Claude Code selesai" -Message $summary
+- Off by default. Turn it on in `config.ps1` or set `speakRecap: true`.
+- Uses `System.Speech.Synthesis.SpeechSynthesizer` at volume 100.
+- `speechRate` sets the speed, from `-10` (slow) to `10` (fast). Default `0`.
+- `speechVoice` picks an installed voice. Empty uses the Windows default.
+  `config.ps1` lists the installed voices to choose from.
+- Speaks the same cleaned recap shown in the toast. People nearby can hear it.
 
-# Text-to-speech
-Add-Type -AssemblyName System.Speech
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.Rate = 0        # -10 (slow) to 10 (fast)
-$synth.Volume = 100
-$synth.Speak($summary)
-```
+## Speech lock
+
+Each hook invocation is its own process, so two `Stop` events close together could
+speak at the same time. A named mutex, `Local\cc-notif-speech`, lets one recap speak
+at a time. A second recap waits up to 30 seconds for the first to finish, then
+skips.
 
 ## Behavior notes
 
-- **Recap source**: the toast/speech text is Claude's actual closing message for the
-  turn, not a separately generated summary — quality depends on how Claude phrases
-  its final reply.
-- **Per-turn, not per-session**: `Stop` fires once per turn. A multi-step task that
-  pauses to ask a question will trigger a notification at that pause too, not only at
-  true completion.
-- **Must not block the agent loop**: the script should always exit 0. `Stop` can force
+- **Recap source**: the text is Claude's actual closing message for the turn, not a
+  separately generated summary. Quality depends on how Claude phrases its reply.
+- **Per-turn, not per-session**: `Stop` fires once per turn. A task that pauses to
+  ask a question triggers a notification at that pause too.
+- **Never blocks the agent loop**: the script always exits 0. `Stop` would force
   Claude to keep responding on exit code 2.
-- **Toast truncation**: Windows toast templates typically render 2–3 lines regardless
-  of string length, so the 200-char trim is a ceiling, not a guarantee of what's shown.
-- **Overlapping speech**: each hook invocation spawns its own process, so two `Stop`
-  events close together can produce overlapping audio. Add a mutex/lock-file check at
-  the top of the script if this becomes a problem in practice.
-- **Voice selection**: default SAPI voices are usable but robotic. List installed
-  voices with:
-  ```powershell
-  Add-Type -AssemblyName System.Speech
-  (New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices() |
-    ForEach-Object { $_.VoiceInfo.Name }
-  ```
-  Select one with `$synth.SelectVoice("Microsoft Zira Desktop")`.
-
-## Optional enhancements (not yet implemented)
-
-1. **Steer the recap via `CLAUDE.md`** — add "end each turn with a one-line summary of
-   what was done" so `last_assistant_message` is consistently short and speakable.
-2. **`"type": "prompt"` hook on `Stop`** — send the turn to a fast model for a short,
-   structured recap instead of using the raw closing message. More consistent, adds a
-   small extra API call per turn. Worth splitting into two strings if adopted: a
-   readable toast line and a shorter, cleaner line for `Speak()` (code identifiers and
-   file paths read awkwardly aloud).
+- **Toast truncation**: Windows toasts render 2 to 3 lines regardless of length, so
+  the 200-character limit is a ceiling, not a guarantee of what is shown.

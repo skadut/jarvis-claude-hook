@@ -1,5 +1,7 @@
 ﻿# config.ps1 — Interactive config editor for claude-code-notification
 
+. "$PSScriptRoot\hook-common.ps1"
+
 Write-Host ""
 Write-Host "=== Claude Code Notification Config ===" -ForegroundColor Cyan
 Write-Host ""
@@ -73,6 +75,18 @@ function Set-Field {
     else { $cfg | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
 }
 
+function Read-Message {
+    param([string]$Name, [string]$Label, [int]$ArgumentCount = 1)
+    Write-Host ""
+    Write-Host $Label -ForegroundColor Yellow
+    $current = $cfg.$Name
+    Write-Host "  Current: $(if ($current) { $current } else { '(default)' })" -ForegroundColor Gray
+    $v = Read-Host "  New value"
+    if ($v -eq '') { return }
+    if (Test-MessageTemplate $v $ArgumentCount) { Set-Field $Name $v }
+    else { Write-Host "  [!!] Invalid braces. Use {0}$(if ($ArgumentCount -gt 1) { ' and {1}' }), or {{ }} for literal braces. Skipped." -ForegroundColor Red }
+}
+
 
 # Title
 Write-Host ""
@@ -81,19 +95,9 @@ Write-Host "  Current: $($cfg.title)" -ForegroundColor Gray
 $v = Read-Host "  New value"
 if ($v -ne '') { $cfg.title = $v }
 
-# Message
-Write-Host ""
-Write-Host "Notification message ({0} = session name)" -ForegroundColor Yellow
-Write-Host "  Current: $($cfg.message)" -ForegroundColor Gray
-$v = Read-Host "  New value"
-if ($v -ne '') { $cfg.message = $v }
-
-# Ask message
-Write-Host ""
-Write-Host "Input-needed message ({0} = session name)" -ForegroundColor Yellow
-Write-Host "  Current: $(if ($cfg.askMessage) { $cfg.askMessage } else { '(default)' })" -ForegroundColor Gray
-$v = Read-Host "  New value"
-if ($v -ne '') { Set-Field 'askMessage' $v }
+Read-Message 'message' 'Notification message ({0} = session name)'
+Read-Message 'askMessage' 'Input-needed message ({0} = session name)'
+Read-Message 'subagentMessage' 'Agent-started message ({0} = agent type, {1} = session name)' 2
 
 # Done sound
 $v = Read-SoundPath "Sound when a session finishes" $cfg.sound
@@ -103,15 +107,63 @@ if ($null -ne $v) { Set-Field 'sound' $v }
 $v = Read-SoundPath "Sound when Claude needs your input (empty = same as above)" $cfg.askSound
 if ($null -ne $v) { Set-Field 'askSound' $v }
 
+# Subagent sound
+$v = Read-SoundPath "Sound when a subagent starts (empty = finished sound)" $cfg.subagentSound
+if ($null -ne $v) { Set-Field 'subagentSound' $v }
+
 # Sound Duration
 Write-Host ""
 Write-Host "Sound duration in seconds" -ForegroundColor Yellow
 Write-Host "  Current: $($cfg.soundDuration)" -ForegroundColor Gray
 $v = Read-Host "  New value"
 if ($v -ne '') {
-    try { $cfg.soundDuration = [int]$v } catch {
-        Write-Host "  [!!] Not a number. Skipped." -ForegroundColor Red
+    if ($v -match '^\d+$' -and [long]$v -le [int]::MaxValue) { Set-Field 'soundDuration' ([int]$v) }
+    else { Write-Host "  [!!] Use a whole number 0 or higher. Skipped." -ForegroundColor Red }
+}
+
+function Read-YesNo {
+    param([string]$Name, [string]$Label, [bool]$Default)
+    $current = if ($cfg.$Name -is [bool]) { $cfg.$Name } else { $Default }
+    Write-Host ""
+    Write-Host "$Label (y/n)" -ForegroundColor Yellow
+    Write-Host "  Current: $(if ($current) { 'y' } else { 'n' })" -ForegroundColor Gray
+    $v = Read-Host "  New value"
+    if ($v -in 'y', 'yes') { Set-Field $Name $true }
+    elseif ($v -in 'n', 'no') { Set-Field $Name $false }
+    elseif ($v -ne '') { Write-Host "  [!!] Type y or n. Skipped." -ForegroundColor Red }
+}
+
+# Stop recap
+Read-YesNo 'stopRecap' "Show Claude's last reply in the finished toast" $true
+
+# Text-to-speech
+Read-YesNo 'speakRecap' 'Read the finished recap aloud (text-to-speech; people nearby will hear it)' $false
+
+if ($cfg.speakRecap -eq $true) {
+    Write-Host ""
+    Write-Host "Speech rate (-10 slow to 10 fast)" -ForegroundColor Yellow
+    Write-Host "  Current: $(if (Test-SpeechRate $cfg.speechRate) { $cfg.speechRate } else { 0 })" -ForegroundColor Gray
+    $v = Read-Host "  New value"
+    if ($v -ne '') {
+        if ($v -match '^-?\d+$' -and [int]$v -ge -10 -and [int]$v -le 10) { Set-Field 'speechRate' ([int]$v) }
+        else { Write-Host "  [!!] Use a whole number from -10 to 10. Skipped." -ForegroundColor Red }
     }
+
+    $voices = @()
+    try {
+        Add-Type -AssemblyName System.Speech
+        $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+        $voices = @($synth.GetInstalledVoices() | Where-Object Enabled | ForEach-Object { $_.VoiceInfo.Name })
+        $synth.Dispose()
+    } catch {}
+    Write-Host ""
+    Write-Host "Voice" -ForegroundColor Yellow
+    Write-Host "  Current: $(if ($cfg.speechVoice) { $cfg.speechVoice } else { '(Windows default)' })" -ForegroundColor Gray
+    for ($i = 0; $i -lt $voices.Count; $i++) { Write-Host "  $($i + 1). $($voices[$i])" -ForegroundColor Gray }
+    $v = Read-Host "  Number, 'default', or Enter to keep"
+    if ($v -eq 'default') { Set-Field 'speechVoice' '' }
+    elseif ($v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le $voices.Count) { Set-Field 'speechVoice' $voices[[int]$v - 1] }
+    elseif ($v -ne '') { Write-Host "  [!!] Unknown voice. Skipped." -ForegroundColor Red }
 }
 
 # Locale
@@ -133,10 +185,14 @@ Write-Host ""
 Write-Host "--- Saved ---" -ForegroundColor Green
 Write-Host "  File:     $ConfigPath"
 Write-Host "  Title:    $($cfg.title)"
-Write-Host "  Message:  $($cfg.message -f 'my-project')"
-Write-Host "  Ask msg:  $($cfg.askMessage -f 'my-project')"
+Write-Host "  Message:  $(if (Test-MessageTemplate $cfg.message) { $cfg.message -f 'my-project' } else { '(default)' })"
+Write-Host "  Ask msg:  $(if (Test-MessageTemplate $cfg.askMessage) { $cfg.askMessage -f 'my-project' } else { '(default)' })"
+Write-Host "  Subagent: $(if (Test-MessageTemplate $cfg.subagentMessage 2) { $cfg.subagentMessage -f 'Explore', 'my-project' } else { '(default)' })"
+Write-Host "  Sub snd:  $(if ($cfg.subagentSound) { $cfg.subagentSound } else { '(same as finished)' })"
 Write-Host "  Sound:    $(if ($cfg.sound) { $cfg.sound } else { '(disabled)' })"
 Write-Host "  Ask snd:  $(if ($cfg.askSound) { $cfg.askSound } else { '(same as above)' })"
 Write-Host "  Duration: $($cfg.soundDuration)s"
+Write-Host "  Recap:    $(if ($cfg.stopRecap -eq $false) { 'off' } else { 'on' })"
+Write-Host "  Speech:   $(if ($cfg.speakRecap -eq $true) { "on, rate $(if (Test-SpeechRate $cfg.speechRate) { $cfg.speechRate } else { 0 }), voice $(if ($cfg.speechVoice) { $cfg.speechVoice } else { 'default' })" } else { 'off' })"
 Write-Host "  Locale:   $($cfg.locale)"
 Write-Host ""

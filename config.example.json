@@ -1,9 +1,15 @@
-{
-  "title": "Claude Code",
+﻿{
+  "title": "jarvis-hook",
   "message": "Session '{0}' done!",
   "askMessage": "Session '{0}' needs your input",
+  "subagentMessage": "{0} agent started in '{1}'",
   "sound": "",
   "askSound": "",
+  "subagentSound": "",
   "soundDuration": 3,
+  "stopRecap": true,
+  "speakRecap": false,
+  "speechRate": 0,
+  "speechVoice": "",
   "locale": "en"
 }
